@@ -279,6 +279,8 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
         fastmcp_access_token_expiry_seconds: int | None = None,
         # Token refresh threshold
         token_expiry_threshold_seconds: int = 0,
+        # Refresh upstream tokens that fail validation before they expire
+        refresh_on_validation_failure: bool = False,
         # CIMD (Client ID Metadata Document) support
         enable_cimd: bool = True,
     ):
@@ -374,6 +376,11 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
                 a token as expired (default 0). This prevents race conditions where a token
                 passes the expiry check but expires before the next operation completes.
                 For example, set to 30 to refresh tokens that will expire within 30 seconds.
+            refresh_on_validation_failure: Also refresh the upstream token when it fails
+                validation before it expires (default False). Some providers revoke access
+                tokens early, e.g. when the user's IdP session ends, while the refresh token
+                stays valid; with this set, such a token is renewed in the same request
+                instead of answering 401. Requires a stored upstream refresh token.
             enable_cimd: Enable CIMD (Client ID Metadata Document) support for URL-based
                 client IDs. When True, clients can authenticate using HTTPS URLs as client
                 IDs, with metadata fetched from the URL. Supports private_key_jwt auth.
@@ -482,6 +489,7 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
             fastmcp_access_token_expiry_seconds
         )
         self._token_expiry_threshold_seconds: int = token_expiry_threshold_seconds
+        self._refresh_on_validation_failure: bool = refresh_on_validation_failure
 
         if jwt_signing_key is None:
             if upstream_client_secret is None:
@@ -1680,6 +1688,23 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
     # Token Validation
     # -------------------------------------------------------------------------
 
+    def _upstream_refresh_due(
+        self,
+        upstream_token_set: UpstreamTokenSet,
+        validated: AccessToken | None,
+    ) -> bool:
+        """Whether load_access_token should refresh the upstream token.
+
+        Due when the token is expired or within the expiry threshold, or, with
+        ``refresh_on_validation_failure``, when it failed validation.
+        """
+        if (
+            upstream_token_set.expires_at
+            <= time.time() + self._token_expiry_threshold_seconds
+        ):
+            return True
+        return validated is None and self._refresh_on_validation_failure
+
     def _get_verification_token(
         self, upstream_token_set: UpstreamTokenSet
     ) -> str | None:
@@ -1847,12 +1872,12 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
                 return None
             validated = await self._token_validator.verify_token(verification_token)
 
-            # 4. Determine if refresh is needed. Two cases:
+            # 4. Determine if refresh is needed. Three cases:
             #    a) Validation failed and token is expired/within threshold
             #    b) Validation passed but token is within threshold (proactive)
+            #    c) Validation failed and refresh_on_validation_failure is set
             needs_refresh = upstream_token_set.refresh_token and (
-                upstream_token_set.expires_at
-                <= time.time() + self._token_expiry_threshold_seconds
+                self._upstream_refresh_due(upstream_token_set, validated)
             )
             should_refresh = needs_refresh and (
                 not validated
@@ -1884,12 +1909,9 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
                             )
 
                         # Only refresh if the (possibly reloaded) token is
-                        # still within threshold — a freshly-refreshed token
-                        # doesn't need another refresh.
-                        if (
-                            upstream_token_set.expires_at
-                            <= time.time() + self._token_expiry_threshold_seconds
-                        ):
+                        # still due — a freshly-refreshed token doesn't need
+                        # another refresh.
+                        if self._upstream_refresh_due(upstream_token_set, validated):
                             upstream_token_set = await self._try_transparent_refresh(
                                 upstream_token_set
                             )

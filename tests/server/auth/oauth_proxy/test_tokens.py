@@ -1567,6 +1567,137 @@ class TestTransparentUpstreamRefresh:
         # Refresh should NOT have been attempted
         mock_oauth_client.refresh_token.assert_not_called()
 
+    async def _setup_unexpired_session(
+        self, proxy: OAuthProxy, *, access_token: str = "revoked-upstream-access"
+    ) -> str:
+        """Set up a proxy JWT pointing at an unexpired upstream token."""
+        upstream_token_id = "upstream-tok-id"
+        access_jti = "test-access-jti"
+        await proxy._upstream_token_store.put(
+            key=upstream_token_id,
+            value=UpstreamTokenSet(
+                upstream_token_id=upstream_token_id,
+                access_token=access_token,
+                refresh_token="upstream-refresh-tok",
+                refresh_token_expires_at=time.time() + 86400,
+                expires_at=time.time() + 3600,
+                token_type="Bearer",
+                scope="read",
+                client_id="test-client",
+                created_at=time.time() - 60,
+            ),
+            ttl=86400,
+        )
+        await proxy._jti_mapping_store.put(
+            key=access_jti,
+            value=JTIMapping(
+                jti=access_jti,
+                upstream_token_id=upstream_token_id,
+                created_at=time.time(),
+            ),
+            ttl=3600,
+        )
+        return proxy.jwt_issuer.issue_access_token(
+            client_id="test-client",
+            scopes=["read"],
+            jti=access_jti,
+            expires_in=3600,
+        )
+
+    async def test_refresh_on_validation_failure_refreshes_unexpired_token(self, proxy):
+        """With refresh_on_validation_failure, a rejected unexpired token is refreshed."""
+        proxy._refresh_on_validation_failure = True
+        fastmcp_jwt = await self._setup_unexpired_session(proxy)
+
+        mock_oauth_client = AsyncMock()
+        mock_oauth_client.refresh_token = AsyncMock(
+            return_value={
+                "access_token": "refreshed-upstream-access",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "refresh_token": "rotated-refresh-tok",
+                "scope": "read",
+            }
+        )
+
+        with patch.object(
+            proxy, "_create_upstream_oauth_client", return_value=mock_oauth_client
+        ):
+            result = await proxy.load_access_token(fastmcp_jwt)
+
+        assert result is not None
+        assert result.token == "refreshed-upstream-access"
+        mock_oauth_client.refresh_token.assert_called_once()
+        stored = await proxy._upstream_token_store.get(key="upstream-tok-id")
+        assert stored is not None
+        assert stored.refresh_token == "rotated-refresh-tok"
+
+    async def test_refresh_on_validation_failure_skips_refresh_when_reload_is_valid(
+        self, proxy
+    ):
+        """A token another task refreshed while this one waited is not refreshed again."""
+        proxy._refresh_on_validation_failure = True
+        fastmcp_jwt = await self._setup_unexpired_session(proxy)
+        refreshed = UpstreamTokenSet(
+            upstream_token_id="upstream-tok-id",
+            access_token="refreshed-by-other-task",
+            refresh_token="rotated-refresh-tok",
+            refresh_token_expires_at=time.time() + 86400,
+            expires_at=time.time() + 3600,
+            token_type="Bearer",
+            scope="read",
+            client_id="test-client",
+            created_at=time.time(),
+        )
+        original_get = proxy._upstream_token_store.get
+        reads = 0
+
+        async def get_after_other_refresh(key: str) -> UpstreamTokenSet | None:
+            nonlocal reads
+            reads += 1
+            if reads == 1:
+                return await original_get(key)
+            return refreshed
+
+        mock_oauth_client = AsyncMock()
+        mock_oauth_client.refresh_token = AsyncMock()
+
+        with (
+            patch.object(
+                proxy, "_create_upstream_oauth_client", return_value=mock_oauth_client
+            ),
+            patch.object(
+                proxy._upstream_token_store, "get", side_effect=get_after_other_refresh
+            ),
+        ):
+            result = await proxy.load_access_token(fastmcp_jwt)
+
+        assert result is not None
+        assert result.token == "refreshed-by-other-task"
+        mock_oauth_client.refresh_token.assert_not_called()
+
+    async def test_refresh_on_validation_failure_keeps_valid_token(self, proxy):
+        """An unexpired token that passes validation is never refreshed."""
+        proxy._refresh_on_validation_failure = True
+        fastmcp_jwt = await self._setup_unexpired_session(
+            proxy, access_token="valid-upstream-access"
+        )
+
+        mock_oauth_client = AsyncMock()
+        mock_oauth_client.refresh_token = AsyncMock()
+
+        with patch.object(
+            proxy, "_create_upstream_oauth_client", return_value=mock_oauth_client
+        ):
+            result = await proxy.load_access_token(fastmcp_jwt)
+
+        assert result is not None
+        assert result.token == "valid-upstream-access"
+        mock_oauth_client.refresh_token.assert_not_called()
+
+    def test_refresh_on_validation_failure_defaults_to_false(self, proxy):
+        assert proxy._refresh_on_validation_failure is False
+
     async def test_reload_from_storage_after_refresh_failure(self, proxy):
         """If refresh fails, re-read from storage in case another worker refreshed."""
         fastmcp_jwt = await self._setup_expired_session(proxy)
